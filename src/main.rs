@@ -1,17 +1,22 @@
 use insights_core_updater::{Core, CoreInfo};
 use log;
 use simplelog::LevelPadding;
-use std::fs::File;
+use std::env;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 
 const LOG_FILE_PATH: &str = "insights-core-updater.log";
 const CORE_FILE_PATH: &str = "insights-core.egg";
-const CACHE_FILE_PATH: &str = "insights-core-updater.json";
+const CORE_SIGNATURE_FILE_PATH: &str = "insights-core.egg.asc";
+const CACHE_FILE_PATH: &str = "insights-core-updater.cache";
 
 
 fn set_up_logging() {
-    // TODO Log all logs, not just the updater, if some envvar is set
     // TODO .set_time_offset()
     //  set_time_offset_to_local() doesn't work, it doesn't know where we are
+    let mut fp: File = OpenOptions::new().create(true).append(true).open(LOG_FILE_PATH).unwrap();
+    _ = fp.write("\n".as_bytes());
+
     let config = simplelog::ConfigBuilder::new()
         .set_max_level(simplelog::LevelFilter::Error)
         .set_level_padding(LevelPadding::Right)
@@ -27,12 +32,14 @@ fn set_up_logging() {
         .set_time_format_custom(simplelog::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]+[offset_hour]:[offset_minute]"))
         .build();
 
-    _ = simplelog::CombinedLogger::init(
-        vec![
-            simplelog::TermLogger::new(simplelog::LevelFilter::Debug, config.clone(), simplelog::TerminalMode::Mixed, simplelog::ColorChoice::Auto),
-            simplelog::WriteLogger::new(simplelog::LevelFilter::Debug, config.clone(), File::create(LOG_FILE_PATH).unwrap()),
-        ]
-    );
+    let term = simplelog::TermLogger::new(simplelog::LevelFilter::Debug, config.clone(), simplelog::TerminalMode::Mixed, simplelog::ColorChoice::Auto);
+    let file = simplelog::WriteLogger::new(simplelog::LevelFilter::Debug, config.clone(), fp);
+
+    if env::var("DEBUG").is_ok() {
+        _ = simplelog::CombinedLogger::init(vec![term, file]);
+    } else {
+        _ = simplelog::CombinedLogger::init(vec![file]);
+    }
 }
 
 #[tokio::main]
@@ -43,29 +50,39 @@ async fn main() {
         return;
     }
 
-    let fresh_core_info: Option<CoreInfo> = CoreInfo::fetch().await;
-    if let None = fresh_core_info {
-        println!("Information about Core could not be fetched.");
-        return;
-    }
-    let fresh_core_info = fresh_core_info.unwrap();
-
-    let cached_core_info: Option<CoreInfo> = CoreInfo::from_cache(CACHE_FILE_PATH);
-    let cached_core_info: CoreInfo = cached_core_info.unwrap_or_else(|| CoreInfo::new());
-
-    if fresh_core_info.etag == cached_core_info.etag {
-        log::info!("ETag values match, no need to do anything.");
-        return;
-    }
+    let cache: Option<CoreInfo> = CoreInfo::from_cache(CACHE_FILE_PATH);
+    let cache: CoreInfo = cache.unwrap_or_else(|| CoreInfo::new());
 
     let core: Option<Core> = Core::fetch().await;
     if let None = core {
         println!("Core could not be fetched.");
         return;
     }
-    let core = core.unwrap();
+    let mut core = core.unwrap();
 
-    core.cache(CORE_FILE_PATH);
-    fresh_core_info.cache(CACHE_FILE_PATH);
+    if cache.etag == core.info.etag {
+        log::info!("ETag values match, no need to do anything.");
+        println!("Nothing to do.");
+        return;
+    }
+    log::debug!(
+        "The egg changed on \"{}\", its etag is {}.",
+        core.info.last_modified.clone().unwrap_or("?".to_string()),
+        core.info.etag.clone().unwrap_or("?".to_string()),
+    );
+    if core.fetch_signature().await.is_none() {
+        log::error!("Could not fetch signature.");
+        return;
+    }
+
+    if core.cache(CORE_FILE_PATH, CORE_SIGNATURE_FILE_PATH).is_none() {
+        log::error!("Could not save core and its signature.");
+        return;
+    }
+    if core.info.cache(CACHE_FILE_PATH).is_none() {
+        log::error!("Could not save Core cache.");
+        return;
+    }
+
     println!("New Core saved at {}.", CORE_FILE_PATH);
 }
